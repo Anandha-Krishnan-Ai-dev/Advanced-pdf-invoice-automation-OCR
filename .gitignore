@@ -1,0 +1,41 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.env.*
+
+# Local invoices and generated data
+input/*
+output/*
+
+# Keep empty folders in Git
+!input/.gitkeep
+!output/.gitkeep
+!output/text/.gitkeep
+!output/archive/.gitkeep
+!output/review_queue/.gitkeep
+!output/quarantine/.gitkeep
+
+# Databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Temporary files
+.*.tmp.xlsx
+*.tmp
+
+# IDE files
+.idea/
+.vscode/
+
+# Operating system files
+.DS_Store
+Thumbs.db
