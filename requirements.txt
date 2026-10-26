@@ -4,3 +4,15 @@ openpyxl
 PyMuPDF
 pytesseract
 Pillow
+
+
+For OCR functionality, you will need to install Tesseract OCR separately.
+
+macOS (Homebrew):
+
+brew install tesseract
+
+
+Windows:
+
+Download and install the UB Mannheim Tesseract installer and ensure tesseract.exe is added to your system PATH
