@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
@@ -16,7 +17,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
@@ -129,7 +130,7 @@ DESCRIPTION_BLOCK_PATTERNS = [
         r"\b(?:Description|Particulars|Item(?:\s+Description)?|Service)\s+"
         r"(?:Qty\s+|Quantity\s+|Rate\s+|Price\s+)*Amount\b"
         r"(.*?)"
-        r"\b(?:Subtotal|Sub-Total|Tax|CGST|SGST|IGST|GST|VAT|Discount|Total\s+Amount|Grand\s+Total|Amount\s+Due)\b",
+        r"(?m)^\s*(?:Subtotal|Sub-Total|Tax|CGST|SGST|IGST|GST|VAT|Discount|Total\s+Amount|Grand\s+Total|Amount\s+Due)\b",
         re.IGNORECASE | re.DOTALL,
     ),
 ]
@@ -171,7 +172,9 @@ class PiiRedactingFilter(logging.Filter):
     """Redact emails, phone numbers, tax IDs, and tagged customer names in logs."""
 
     EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-    PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
+    PHONE_RE = re.compile(
+        r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
+    )
     GSTIN_RE = re.compile(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b")
 
     def __init__(self, enabled: bool = True) -> None:
@@ -197,6 +200,14 @@ def mask_customer_name(name: Optional[str], redact: bool = True) -> str:
     if not redact or len(name) <= 3:
         return name
     return f"{name[:2]}***{name[-1]}"
+
+
+def sanitize_excel_text(value: Optional[str]) -> str:
+    """Prevent Excel formula injection by escaping leading =, +, -, or @."""
+    text = (value or "Not Found").strip()
+    if text.startswith(("=", "+", "-", "@")):
+        return f"'{text}"
+    return text
 
 
 # ============================================================
@@ -337,9 +348,9 @@ def extract_pdf_text(pdf_path: Path) -> tuple[str, str, list[str]]:
     return "\n".join(pages).strip(), method, warnings
 
 
-def save_text_file(pdf_path: Path, text: str) -> Path:
-    """Save extracted text for debugging and audit purposes."""
-    output_path = TEXT_FOLDER / f"{pdf_path.stem}.txt"
+def save_text_file(pdf_path: Path, file_hash: str, text: str) -> Path:
+    """Save extracted text using short SHA-256 suffix to prevent collisions."""
+    output_path = TEXT_FOLDER / f"{pdf_path.stem}_{file_hash[:8]}.txt"
     output_path.write_text(text, encoding="utf-8")
     return output_path
 
@@ -405,7 +416,6 @@ def extract_total_and_currency(text: str) -> tuple[Optional[Decimal], str]:
     for pattern in TOTAL_AMOUNT_PATTERNS:
         matches = list(pattern.finditer(text))
         if matches:
-            # Prefer the last match in case "Total" appears in headers
             last_match = matches[-1]
             raw_curr, raw_amt = last_match.group(1), last_match.group(2)
             amount = parse_decimal(raw_amt)
@@ -553,7 +563,7 @@ def build_record(
 # ============================================================
 def init_history_db(db_path: Path) -> None:
     """Create the SQLite table for tracking processed invoices across runs."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS processed_invoices (
@@ -579,7 +589,6 @@ def init_history_db(db_path: Path) -> None:
 
 def flag_duplicates(records: list[dict[str, Any]], db_path: Path) -> None:
     """Flag both in-batch and cross-run duplicates using SQLite history."""
-    # 1. In-batch duplicate invoice numbers and file hashes
     inv_counts = Counter(
         r["invoice_number"].casefold()
         for r in records
@@ -601,8 +610,7 @@ def flag_duplicates(records: list[dict[str, Any]], db_path: Path) -> None:
             )
             record["status"] = "REVIEW"
 
-    # 2. Historical cross-run duplicate check via SQLite
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cursor = conn.cursor()
         for record in records:
             cursor.execute(
@@ -649,7 +657,7 @@ def record_run_in_history_db(
         )
         for r in records
     ]
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.executemany(
             """
             INSERT INTO processed_invoices (
@@ -665,12 +673,14 @@ def record_run_in_history_db(
 # UPGRADE 5B: SAFE FILE ROUTING (ARCHIVE / REVIEW / QUARANTINE)
 # ============================================================
 def move_file_safely(src: Path, dest_folder: Path) -> Path:
-    """Move a file to dest_folder, appending a timestamp if a name collision exists."""
+    """Move a file to dest_folder, appending a unique suffix if a collision exists."""
     dest_folder.mkdir(parents=True, exist_ok=True)
     target = dest_folder / src.name
-    if target.exists():
+    counter = 1
+    while target.exists():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target = dest_folder / f"{src.stem}_{timestamp}{src.suffix}"
+        target = dest_folder / f"{src.stem}_{timestamp}_{counter}{src.suffix}"
+        counter += 1
     shutil.move(str(src), str(target))
     return target
 
@@ -682,31 +692,37 @@ def create_excel_report(
     records: list[dict[str, Any]],
     output_path: Path,
 ) -> None:
-    """Create a formatted invoice report and save it atomically."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Invoice Report"
-
-    ws.append(HEADERS)
-
+    """Create or append to the formatted invoice report and save it atomically."""
     header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
     review_fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
 
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center",
-            wrap_text=True,
+    if output_path.exists():
+        wb = load_workbook(output_path)
+        ws = (
+            wb["Invoice Report"]
+            if "Invoice Report" in wb.sheetnames
+            else wb.active
         )
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Invoice Report"
+        ws.append(HEADERS)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
 
     for record in records:
         ws.append([
-            record["invoice_number"] or "Not Found",
-            record["customer"] or "Not Found",
-            record["description"] or "Not Found",
+            sanitize_excel_text(record["invoice_number"]),
+            sanitize_excel_text(record["customer"]),
+            sanitize_excel_text(record["description"]),
             record["currency"],
             float(record["line_items_sum"]) if record["line_items_sum"] is not None else None,
             float(record["tax_amount"]) if record["tax_amount"] is not None else None,
@@ -716,7 +732,7 @@ def create_excel_report(
             record["source_pdf"],
             record["file_hash"][:12],
             record["status"],
-            "; ".join(record["review_notes"]),
+            sanitize_excel_text("; ".join(record["review_notes"])) if record["review_notes"] else "",
         ])
 
         row_number = ws.max_row
@@ -724,7 +740,6 @@ def create_excel_report(
             record["currency"], CURRENCY_FORMATS["INR"]
         )
 
-        # Format monetary columns (columns 5, 6, 7, 8)
         for col_idx in (5, 6, 7, 8):
             amount_cell = ws.cell(row=row_number, column=col_idx)
             if amount_cell.value is not None:
@@ -766,6 +781,7 @@ def create_excel_report(
         wb.save(temp_path)
         os.replace(temp_path, output_path)
     finally:
+        wb.close()
         if temp_path.exists():
             temp_path.unlink()
 
@@ -784,7 +800,7 @@ class InvoiceAutomationTests(unittest.TestCase):
             "Acme Global Solutions Pvt Ltd\n"
             "Particulars Qty Rate Amount\n"
             "Cloud Hosting Services ₹ 10,000.00\n"
-            "Managed Support ₹ 5,000.00\n"
+            "Tax Advisory Services ₹ 5,000.00\n"
             "CGST (9%) ₹ 1,350.00\n"
             "SGST (9%) ₹ 1,350.00\n"
             "Discount ₹ 700.00\n"
@@ -946,7 +962,7 @@ def main() -> int:
                     move_file_safely(pdf_file, QUARANTINE_FOLDER)
                 continue
 
-            save_text_file(pdf_file, text)
+            save_text_file(pdf_file, file_hash, text)
 
             record = build_record(pdf_file, file_hash, text, method, warnings)
             records.append(record)
@@ -986,7 +1002,6 @@ def main() -> int:
             record_run_in_history_db(records, DB_FILE)
             logging.info("Excel report saved: %s", EXCEL_FILE.resolve())
 
-            # Route processed PDFs only after report and DB commit succeed
             if not args.keep_input:
                 for record in records:
                     src_pdf = pdf_map.get(record["source_pdf"])
