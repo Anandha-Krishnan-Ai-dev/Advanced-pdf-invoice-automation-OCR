@@ -24,9 +24,9 @@ from pypdf import PdfReader
 
 # Optional OCR imports (graceful fallback if not installed)
 try:
-    import fitz  # PyMuPDF
-    import pytesseract
-    from PIL import Image
+    import fitz  # type: ignore[import-not-found]
+    import pytesseract  # type: ignore[import-untyped]
+    from PIL import Image  # type: ignore[import-not-found]
 
     OCR_AVAILABLE = True
 except ImportError:
@@ -113,12 +113,10 @@ INVOICE_NUMBER_PATTERNS = [
 ]
 
 CUSTOMER_PATTERNS = [
-    # Single-line label: "Customer: Acme Corp" or "Bill To: Acme Corp"
     re.compile(
         r"^\s*(?:Customer(?:\s+Name)?|Bill(?:ed)?\s+To|Client(?:\s+Name)?|Buyer)\s*[:\-]\s*(.+?)\s*$",
         re.IGNORECASE | re.MULTILINE,
     ),
-    # Multi-line block where customer name is on the line immediately after "Bill To:"
     re.compile(
         r"^\s*(?:Customer|Bill(?:ed)?\s+To|Client|Buyer)\s*[:\-]?\s*\r?\n\s*([A-Za-z0-9][^\r\n]{2,80}?)\s*$",
         re.IGNORECASE | re.MULTILINE,
@@ -314,7 +312,6 @@ def extract_pdf_text(pdf_path: Path) -> tuple[str, str, list[str]]:
             used_text = True
             continue
 
-        # Fallback to OCR when embedded text is missing or too short
         try:
             ocr_text = ocr_pdf_page(pdf_path, page_index)
             if ocr_text:
@@ -539,7 +536,6 @@ def build_record(
             f"Non-positive total amount ({total_amount}); verify credit note or error"
         )
 
-    # Independent arithmetic verification when line items are present
     if line_items_sum is not None and total_amount is not None:
         tax = tax_amount or Decimal("0.00")
         discount = discount_amount or Decimal("0.00")
@@ -974,7 +970,6 @@ def main() -> int:
             if not args.keep_input and pdf_file.exists():
                 move_file_safely(pdf_file, QUARANTINE_FOLDER)
 
-    # Check both in-batch and cross-run SQLite duplicates
     flag_duplicates(records, DB_FILE)
 
     for record in records:
